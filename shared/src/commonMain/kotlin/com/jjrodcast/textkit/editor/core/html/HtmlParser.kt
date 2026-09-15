@@ -292,12 +292,16 @@ internal class HtmlParser {
     private fun mapBlocks(nodes: List<Node>, marks: Set<Mark> = emptySet()): List<BaseParagraph> {
         val blocks = mutableListOf<BaseParagraph>()
         val looseInline = mutableListOf<Node>()
-        fun flushLoose() {
+        fun flushLoose(trailing: Boolean = false) {
             val content = mapInline(looseInline, marks)
             looseInline.clear()
-            // a run of nothing but breaks (Apple's trailing interchange <br>) is clipboard
-            // framing, not content
-            if (content.any { it !is HardBreak }) blocks += Paragraph(content = content)
+            when {
+                content.isEmpty() -> Unit
+                content.any { it !is HardBreak } -> blocks += Paragraph(content = content)
+                // a break-only run at the very end is clipboard framing (Apple's interchange
+                // <br>); anywhere else it is a visible blank line and stays one
+                !trailing -> blocks += Paragraph()
+            }
         }
         nodes.forEach { node ->
             when {
@@ -322,7 +326,7 @@ internal class HtmlParser {
                 else -> looseInline += node
             }
         }
-        flushLoose()
+        flushLoose(trailing = true)
         return blocks
     }
 
@@ -347,12 +351,12 @@ internal class HtmlParser {
         "blockquote" -> listOf(Blockquote(content = mapBlocks(element.children, marks)))
 
         "ul" ->
-            if (element.attrs[DATA_TYPE] == TASK_LIST_TYPE) listOf(taskList(element))
-            else listOf(BulletedList(content = listItems(element)))
+            if (element.attrs[DATA_TYPE] == TASK_LIST_TYPE) listOf(taskList(element, marks))
+            else listOf(BulletedList(content = listItems(element, marks)))
 
         "ol" -> {
             val start = element.attrs["start"]?.toIntOrNull()?.coerceAtLeast(1) ?: 1
-            listOf(OrderedList(attrs = ListAttrs(start = start), content = listItems(element)))
+            listOf(OrderedList(attrs = ListAttrs(start = start), content = listItems(element, marks)))
         }
 
         "table" -> listOf(tableEmbed(element))
@@ -385,17 +389,17 @@ internal class HtmlParser {
         else -> mapBlocks(element.children, marks)
     }
 
-    private fun listItems(list: Element): List<BaseText> =
+    private fun listItems(list: Element, marks: Set<Mark>): List<BaseText> =
         list.children.filterIsInstance<Element>().filter { it.name == "li" }.map { li ->
-            ListItem(content = mapBlocks(li.children))
+            ListItem(content = mapBlocks(li.children, marks))
         }
 
-    private fun taskList(list: Element): TaskList {
+    private fun taskList(list: Element, marks: Set<Mark>): TaskList {
         val items = list.children.filterIsInstance<Element>().filter { it.name == "li" }.map { li ->
             val checkbox = li.children.filterIsInstance<Element>().firstOrNull { it.name == "input" }
             val checked = li.attrs[DATA_CHECKED] == "true" || checkbox?.attrs?.containsKey("checked") == true
             val content = li.children.filterNot { it is Element && it.name == "input" }
-            TaskListItem(attrs = TaskListAttrs(checked = checked), content = mapBlocks(content))
+            TaskListItem(attrs = TaskListAttrs(checked = checked), content = mapBlocks(content, marks))
         }
         return TaskList(content = items)
     }
@@ -551,8 +555,12 @@ internal class HtmlParser {
         val style = element.attrs["style"]
         var marks = if (tagMark != null) inherited + tagMark else inherited
         if (style == null) return marks
-        var color: String? = null
-        var fontSize = TextStyleAttrs.UNSET_FONT_SIZE
+        // seed from the inherited textStyle so a declaration of one property does not erase the
+        // other — <span style="font-size:20px"><span style="color:red"> keeps both
+        val inheritedStyle = inherited.filterIsInstance<TextStyleMark>().firstOrNull()
+        var color: String? = inheritedStyle?.attrs?.color?.takeIf { it.isNotEmpty() }
+        var fontSize = inheritedStyle?.attrs?.fontSize ?: TextStyleAttrs.UNSET_FONT_SIZE
+        var styleTouched = false
         style.split(';').forEach { declaration ->
             val key = declaration.substringBefore(':').trim().lowercase()
             val value = declaration.substringAfter(':', "").trim().lowercase()
@@ -578,26 +586,44 @@ internal class HtmlParser {
                 "background-color" -> if (value != "transparent" && ExportHtml.safeColor(hexOf(value)) != null) {
                     marks = marks + HighlightMark()
                 }
-                ExportHtml.COLOR -> color = ExportHtml.safeColor(hexOf(value))?.takeIf { it !in DEFAULT_TEXT_COLORS }
-                ExportHtml.FONT_SIZE -> fontSize = parseFontSize(value) ?: fontSize
+                ExportHtml.COLOR -> {
+                    // a declared default (#000000, transparent, an unparseable value) CLEARS the
+                    // inherited color — it overrides in CSS — rather than being ignored
+                    color = ExportHtml.safeColor(hexOf(value))?.takeIf { it !in DEFAULT_TEXT_COLORS }
+                    styleTouched = true
+                }
+                ExportHtml.FONT_SIZE -> parseFontSize(value)?.let {
+                    fontSize = it
+                    styleTouched = true
+                }
             }
         }
-        if (color != null || fontSize != TextStyleAttrs.UNSET_FONT_SIZE) {
-            marks = marks.filterNotTo(mutableSetOf()) { it is TextStyleMark } +
-                TextStyleMark(TextStyleAttrs(color = color ?: "", fontSize = fontSize))
+        if (styleTouched || inheritedStyle != null) {
+            marks = marks.filterNotTo(mutableSetOf()) { it is TextStyleMark }
+            if (color != null || fontSize != TextStyleAttrs.UNSET_FONT_SIZE) {
+                marks = marks + TextStyleMark(TextStyleAttrs(color = color ?: "", fontSize = fontSize))
+            }
         }
         return marks
     }
 
-    /** [value] with an `rgb()`/`rgba()` form converted to hex — browser copies inline computed
-     *  styles, which always come back as `rgb(36, 36, 36)` — passed through otherwise. */
+    /**
+     * [value] with an `rgb()`/`rgba()` form converted to hex — browser copies inline computed
+     * styles, which always come back as `rgb(36, 36, 36)` — passed through otherwise. A fully
+     * transparent `rgba(…, 0)` becomes `transparent` so the highlight and color gates treat it
+     * as the non-color it is; a translucent alpha keeps its channels (a half-opaque yellow is
+     * still a highlight).
+     */
     private fun hexOf(value: String): String {
         val match = RGB_COLOR.find(value) ?: return value
-        val channels = match.groupValues[1].split(',').map { it.trim().toIntOrNull() ?: return value }
-        if (channels.size < 3 || channels.any { it !in 0..255 }) return value
+        val parts = match.groupValues[1].split(',').map { it.trim().toDoubleOrNull() ?: return value }
+        if (parts.size !in 3..4) return value
+        val channels = parts.take(3).map { kotlin.math.round(it).toInt() }
+        if (channels.any { it !in 0..255 }) return value
+        if (parts.size == 4 && parts[3] <= 0.0) return "transparent"
         return buildString {
             append('#')
-            channels.take(3).forEach { channel ->
+            channels.forEach { channel ->
                 append(channel.toString(16).padStart(2, '0'))
             }
         }

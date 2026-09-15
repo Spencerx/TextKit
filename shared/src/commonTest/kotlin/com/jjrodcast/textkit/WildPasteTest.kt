@@ -26,29 +26,32 @@ class WildPasteTest {
 
     private fun allTexts(doc: TextEditorDocument): List<Text> {
         val texts = mutableListOf<Text>()
-        fun visitInline(nodes: List<BaseText>) {
-            nodes.forEach { node ->
-                when (node) {
-                    is Text -> texts += node
-                    is ListItem -> node.content.forEach { visitBlock(it) }
-                    else -> Unit
-                }
-            }
-        }
-        doc.content.forEach { visitBlock(it, ::visitInline) }
+        collectBlocks(doc.content, texts)
         return texts
     }
 
-    private fun visitBlock(
-        block: com.jjrodcast.textkit.editor.core.parser.BaseParagraph,
-        visitInline: (List<BaseText>) -> Unit = { },
-    ) {
-        when (block) {
-            is Paragraph -> visitInline(block.content)
-            is Heading -> visitInline(block.content)
-            is BulletedList -> visitInline(block.content)
-            is com.jjrodcast.textkit.editor.core.parser.Blockquote -> block.content.forEach { visitBlock(it, visitInline) }
-            else -> Unit
+    private fun collectBlocks(blocks: List<com.jjrodcast.textkit.editor.core.parser.BaseParagraph>, texts: MutableList<Text>) {
+        blocks.forEach { block ->
+            when (block) {
+                is Paragraph -> collectInline(block.content, texts)
+                is Heading -> collectInline(block.content, texts)
+                is BulletedList -> collectInline(block.content, texts)
+                is com.jjrodcast.textkit.editor.core.parser.OrderedList -> collectInline(block.content, texts)
+                is com.jjrodcast.textkit.editor.core.parser.TaskList -> collectInline(block.content, texts)
+                is com.jjrodcast.textkit.editor.core.parser.Blockquote -> collectBlocks(block.content, texts)
+                else -> Unit
+            }
+        }
+    }
+
+    private fun collectInline(nodes: List<BaseText>, texts: MutableList<Text>) {
+        nodes.forEach { node ->
+            when (node) {
+                is Text -> texts += node
+                is ListItem -> collectBlocks(node.content, texts)
+                is com.jjrodcast.textkit.editor.core.parser.TaskListItem -> collectBlocks(node.content, texts)
+                else -> Unit
+            }
         }
     }
 
@@ -140,5 +143,37 @@ class WildPasteTest {
         val e = editorFrom(htmlToJson(PasteFixtures.MEDIUM_ARTICLE))
         assertTrue(e.text.contains("growing pains"))
         assertEquals(e.toJson(), editorFrom(e.toJson()).toJson())
+    }
+
+    @Test
+    fun a_standalone_br_between_blocks_is_a_blank_line_but_trailing_framing_drops() {
+        val doc = HtmlParser().parse("<p>one</p><br><p>two</p><br class=\"Apple-interchange-newline\">")
+        assertEquals(3, doc.content.size, "the mid-stream break stays as a blank paragraph")
+        assertTrue((doc.content[1] as Paragraph).content.isEmpty())
+    }
+
+    @Test
+    fun wrapper_marks_reach_list_items() {
+        val doc = HtmlParser().parse("<b><ul><li>x</li></ul></b>")
+        val item = allTexts(doc).single()
+        assertTrue(item.marks.any { it is BoldMark }, "the wrapper bold must reach the list item, got ${item.marks}")
+    }
+
+    @Test
+    fun nested_spans_merge_their_text_styles() {
+        val doc = HtmlParser().parse("<p><span style=\"font-size:20px\"><span style=\"color:#ff0000\">x</span></span></p>")
+        val style = allTexts(doc).single().marks.filterIsInstance<TextStyleMark>().single()
+        assertEquals("#ff0000", style.attrs.color)
+        assertEquals(20, style.attrs.fontSize, "the inherited size must survive the inner color span")
+    }
+
+    @Test
+    fun rgba_alpha_is_respected() {
+        // fully transparent background: not a highlight
+        val transparent = HtmlParser().parse("<p><span style=\"background-color:rgba(255,255,0,0)\">x</span></p>")
+        assertTrue(allTexts(transparent).single().marks.isEmpty(), "a zero-alpha background is not a highlight")
+        // translucent background: still a highlight
+        val translucent = HtmlParser().parse("<p><span style=\"background-color:rgba(255,255,0,0.5)\">x</span></p>")
+        assertTrue(allTexts(translucent).single().marks.any { it is com.jjrodcast.textkit.editor.core.parser.HighlightMark })
     }
 }
