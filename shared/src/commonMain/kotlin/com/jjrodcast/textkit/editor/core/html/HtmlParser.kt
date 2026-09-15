@@ -359,7 +359,7 @@ internal class HtmlParser {
             listOf(OrderedList(attrs = ListAttrs(start = start), content = listItems(element, marks)))
         }
 
-        "table" -> listOf(tableEmbed(element))
+        "table" -> listOf(tableEmbed(element, marks))
 
         "img" -> imageBlock(element)
 
@@ -406,7 +406,7 @@ internal class HtmlParser {
 
     // ── Embeds ───────────────────────────────────────────────────────────────
 
-    private fun tableEmbed(table: Element): EmbedBlock {
+    private fun tableEmbed(table: Element, marks: Set<Mark> = emptySet()): EmbedBlock {
         // tr rows can sit directly in <table> or inside thead/tbody/tfoot sections
         val rows = table.children.filterIsInstance<Element>()
             .flatMap { if (it.name in TABLE_SECTION_TAGS) it.children.filterIsInstance<Element>() else listOf(it) }
@@ -429,7 +429,7 @@ internal class HtmlParser {
                                             put("colwidth", JsonNull)
                                         })
                                         put("content", buildJsonArray {
-                                            cellBlocks(cell).forEach {
+                                            cellBlocks(cell, marks).forEach {
                                                 add(TEXT_EDITOR_JSON.encodeToJsonElement(BaseParagraph.serializer(), it))
                                             }
                                         })
@@ -444,8 +444,8 @@ internal class HtmlParser {
     }
 
     /** A cell's blocks; a cell holding only inline content still yields one paragraph. */
-    private fun cellBlocks(cell: Element): List<BaseParagraph> {
-        val blocks = mapBlocks(cell.children)
+    private fun cellBlocks(cell: Element, marks: Set<Mark> = emptySet()): List<BaseParagraph> {
+        val blocks = mapBlocks(cell.children, marks)
         return blocks.ifEmpty { listOf(Paragraph()) }
     }
 
