@@ -289,13 +289,19 @@ internal class HtmlParser {
 
     // ── Block mapping ────────────────────────────────────────────────────────
 
-    private fun mapBlocks(nodes: List<Node>): List<BaseParagraph> {
+    private fun mapBlocks(nodes: List<Node>, marks: Set<Mark> = emptySet()): List<BaseParagraph> {
         val blocks = mutableListOf<BaseParagraph>()
         val looseInline = mutableListOf<Node>()
-        fun flushLoose() {
-            val content = mapInline(looseInline, emptySet())
+        fun flushLoose(trailing: Boolean = false) {
+            val content = mapInline(looseInline, marks)
             looseInline.clear()
-            if (content.isNotEmpty()) blocks += Paragraph(content = content)
+            when {
+                content.isEmpty() -> Unit
+                content.any { it !is HardBreak } -> blocks += Paragraph(content = content)
+                // a break-only run at the very end is clipboard framing (Apple's interchange
+                // <br>); anywhere else it is a visible blank line and stays one
+                !trailing -> blocks += Paragraph()
+            }
         }
         nodes.forEach { node ->
             when {
@@ -303,37 +309,57 @@ internal class HtmlParser {
                 node is Element && node.name in DROPPED_ELEMENTS -> Unit
                 node is Element && node.name in BLOCK_TAGS -> {
                     flushLoose()
-                    blocks += mapBlock(node)
+                    blocks += mapBlock(node, marks)
+                }
+                // an element that CONTAINS block children is a transparent container. An INLINE
+                // container's cascade flows down — Google Docs wraps whole documents in a styled
+                // <b> whose font-weight:normal suppresses the bold its tag implies. A block-level
+                // container's styles do NOT: a browser copy inlines the page's COMPUTED style onto
+                // every div and section, and honoring that would coat the paste in the site theme.
+                node is Element && node.children.any { it is Element && it.name in BLOCK_TAGS } -> {
+                    flushLoose()
+                    val inherited = if (node.name in INLINE_TAGS) cascade(node, marks, tagMarkOf(node.name)) else marks
+                    blocks += mapBlocks(node.children, inherited)
                 }
                 // anything else — text, marks, unknown inline tags — is loose inline content that
                 // browsers wrap into an implicit paragraph
                 else -> looseInline += node
             }
         }
-        flushLoose()
+        flushLoose(trailing = true)
         return blocks
     }
 
-    private fun mapBlock(element: Element): List<BaseParagraph> = when (element.name) {
-        "p" -> listOf(Paragraph(attrs = ParagraphAttrs(textAlign = alignOf(element)), content = mapInline(element.children, emptySet())))
+    /** The mark an inline tag implies by itself, before its style cascade is applied. */
+    private fun tagMarkOf(name: String): Mark? = when (name) {
+        "strong", "b" -> BoldMark()
+        "em", "i" -> ItalicMark()
+        "u", "ins" -> UnderlineMark()
+        "s", "del", "strike" -> StrikeMark()
+        "mark" -> HighlightMark()
+        else -> null
+    }
+
+    private fun mapBlock(element: Element, marks: Set<Mark> = emptySet()): List<BaseParagraph> = when (element.name) {
+        "p" -> listOf(Paragraph(attrs = ParagraphAttrs(textAlign = alignOf(element)), content = mapInline(element.children, marks)))
 
         "h1", "h2", "h3", "h4", "h5", "h6" -> {
             val level = element.name.drop(1).toInt().coerceIn(HeadingLevels.H1, HeadingLevels.H6)
-            listOf(Heading(attrs = HeadingAttrs(level = level, textAlign = alignOf(element)), content = mapInline(element.children, emptySet())))
+            listOf(Heading(attrs = HeadingAttrs(level = level, textAlign = alignOf(element)), content = mapInline(element.children, marks)))
         }
 
-        "blockquote" -> listOf(Blockquote(content = mapBlocks(element.children)))
+        "blockquote" -> listOf(Blockquote(content = mapBlocks(element.children, marks)))
 
         "ul" ->
-            if (element.attrs[DATA_TYPE] == TASK_LIST_TYPE) listOf(taskList(element))
-            else listOf(BulletedList(content = listItems(element)))
+            if (element.attrs[DATA_TYPE] == TASK_LIST_TYPE) listOf(taskList(element, marks))
+            else listOf(BulletedList(content = listItems(element, marks)))
 
         "ol" -> {
             val start = element.attrs["start"]?.toIntOrNull()?.coerceAtLeast(1) ?: 1
-            listOf(OrderedList(attrs = ListAttrs(start = start), content = listItems(element)))
+            listOf(OrderedList(attrs = ListAttrs(start = start), content = listItems(element, marks)))
         }
 
-        "table" -> listOf(tableEmbed(element))
+        "table" -> listOf(tableEmbed(element, marks))
 
         "img" -> imageBlock(element)
 
@@ -356,31 +382,31 @@ internal class HtmlParser {
                 )
             } else {
                 // a plain div is a transparent container
-                mapBlocks(element.children)
+                mapBlocks(element.children, marks)
             }
         }
 
-        else -> mapBlocks(element.children)
+        else -> mapBlocks(element.children, marks)
     }
 
-    private fun listItems(list: Element): List<BaseText> =
+    private fun listItems(list: Element, marks: Set<Mark>): List<BaseText> =
         list.children.filterIsInstance<Element>().filter { it.name == "li" }.map { li ->
-            ListItem(content = mapBlocks(li.children))
+            ListItem(content = mapBlocks(li.children, marks))
         }
 
-    private fun taskList(list: Element): TaskList {
+    private fun taskList(list: Element, marks: Set<Mark>): TaskList {
         val items = list.children.filterIsInstance<Element>().filter { it.name == "li" }.map { li ->
             val checkbox = li.children.filterIsInstance<Element>().firstOrNull { it.name == "input" }
             val checked = li.attrs[DATA_CHECKED] == "true" || checkbox?.attrs?.containsKey("checked") == true
             val content = li.children.filterNot { it is Element && it.name == "input" }
-            TaskListItem(attrs = TaskListAttrs(checked = checked), content = mapBlocks(content))
+            TaskListItem(attrs = TaskListAttrs(checked = checked), content = mapBlocks(content, marks))
         }
         return TaskList(content = items)
     }
 
     // ── Embeds ───────────────────────────────────────────────────────────────
 
-    private fun tableEmbed(table: Element): EmbedBlock {
+    private fun tableEmbed(table: Element, marks: Set<Mark> = emptySet()): EmbedBlock {
         // tr rows can sit directly in <table> or inside thead/tbody/tfoot sections
         val rows = table.children.filterIsInstance<Element>()
             .flatMap { if (it.name in TABLE_SECTION_TAGS) it.children.filterIsInstance<Element>() else listOf(it) }
@@ -403,7 +429,7 @@ internal class HtmlParser {
                                             put("colwidth", JsonNull)
                                         })
                                         put("content", buildJsonArray {
-                                            cellBlocks(cell).forEach {
+                                            cellBlocks(cell, marks).forEach {
                                                 add(TEXT_EDITOR_JSON.encodeToJsonElement(BaseParagraph.serializer(), it))
                                             }
                                         })
@@ -418,8 +444,8 @@ internal class HtmlParser {
     }
 
     /** A cell's blocks; a cell holding only inline content still yields one paragraph. */
-    private fun cellBlocks(cell: Element): List<BaseParagraph> {
-        val blocks = mapBlocks(cell.children)
+    private fun cellBlocks(cell: Element, marks: Set<Mark> = emptySet()): List<BaseParagraph> {
+        val blocks = mapBlocks(cell.children, marks)
         return blocks.ifEmpty { listOf(Paragraph()) }
     }
 
@@ -483,19 +509,19 @@ internal class HtmlParser {
                 is Element -> when (node.name) {
                     in DROPPED_ELEMENTS -> Unit
                     "br" -> out += HardBreak(marks = marks)
-                    "strong", "b" -> out += mapInline(node.children, marks + BoldMark())
-                    "em", "i" -> out += mapInline(node.children, marks + ItalicMark())
-                    "u", "ins" -> out += mapInline(node.children, marks + UnderlineMark())
-                    "s", "del", "strike" -> out += mapInline(node.children, marks + StrikeMark())
-                    "mark" -> out += mapInline(node.children, marks + HighlightMark())
+                    "strong", "b" -> out += mapInline(node.children, cascade(node, marks, BoldMark()))
+                    "em", "i" -> out += mapInline(node.children, cascade(node, marks, ItalicMark()))
+                    "u", "ins" -> out += mapInline(node.children, cascade(node, marks, UnderlineMark()))
+                    "s", "del", "strike" -> out += mapInline(node.children, cascade(node, marks, StrikeMark()))
+                    "mark" -> out += mapInline(node.children, cascade(node, marks, HighlightMark()))
                     "a" -> {
                         // an unsafe scheme drops the link and keeps the text — safeHref inbound
                         val href = node.attrs["href"]?.let { ExportHtml.safeHref(it) }
                         val linked = if (href != null) marks + LinkMark(LinkAttrs(href = href)) else marks
-                        out += mapInline(node.children, linked)
+                        out += mapInline(node.children, cascade(node, linked, null))
                     }
                     "span" -> out += span(node, marks)
-                    else -> out += mapInline(node.children, marks)
+                    else -> out += mapInline(node.children, cascade(node, marks, null))
                 }
             }
         }
@@ -516,27 +542,99 @@ internal class HtmlParser {
                 else Hashtag(attrs = attrs, marks = marks)
             )
         }
-        val styled = node.attrs["style"]?.let { textStyleFrom(it) }
-        return mapInline(node.children, if (styled != null) marks + styled else marks)
+        return mapInline(node.children, cascade(node, marks, null))
     }
 
-    /** Re-parses a `style` attribute's `color`/`font-size` into a validated [TextStyleMark] —
-     *  values go through the same rules the export applies, so nothing unvetted is carried. */
-    private fun textStyleFrom(style: String): TextStyleMark? {
-        var color: String? = null
-        var fontSize = TextStyleAttrs.UNSET_FONT_SIZE
+    /**
+     * The marks in effect inside [element]: the inherited set, the element's own tag semantics
+     * ([tagMark]), and its `style` declarations applied CSS-cascade style — a declaration both
+     * adds and *overrides*, so Google Docs' `<b style="font-weight:normal">` document wrapper
+     * bolds nothing, and a `font-weight:400` span un-bolds inherited bold (#152).
+     */
+    private fun cascade(element: Element, inherited: Set<Mark>, tagMark: Mark?): Set<Mark> {
+        val style = element.attrs["style"]
+        var marks = if (tagMark != null) inherited + tagMark else inherited
+        if (style == null) return marks
+        // seed from the inherited textStyle so a declaration of one property does not erase the
+        // other — <span style="font-size:20px"><span style="color:red"> keeps both
+        val inheritedStyle = inherited.filterIsInstance<TextStyleMark>().firstOrNull()
+        var color: String? = inheritedStyle?.attrs?.color?.takeIf { it.isNotEmpty() }
+        var fontSize = inheritedStyle?.attrs?.fontSize ?: TextStyleAttrs.UNSET_FONT_SIZE
+        var styleTouched = false
         style.split(';').forEach { declaration ->
             val key = declaration.substringBefore(':').trim().lowercase()
-            val value = declaration.substringAfter(':', "").trim()
+            val value = declaration.substringAfter(':', "").trim().lowercase()
             when (key) {
-                ExportHtml.COLOR -> color = ExportHtml.safeColor(value)
-                ExportHtml.FONT_SIZE -> fontSize = value.removeSuffix("px").trim().toIntOrNull()
-                    ?.takeIf { it in 1..MAX_FONT_SIZE } ?: fontSize
+                "font-weight" -> marks = when {
+                    value == "bold" || value == "bolder" || (value.toIntOrNull() ?: 0) >= BOLD_WEIGHT ->
+                        marks + BoldMark()
+                    value == "normal" || value == "lighter" || value.toIntOrNull() != null ->
+                        marks - BoldMark()
+                    else -> marks
+                }
+                "font-style" -> marks = when (value) {
+                    "italic", "oblique" -> marks + ItalicMark()
+                    "normal" -> marks - ItalicMark()
+                    else -> marks
+                }
+                "text-decoration", "text-decoration-line" -> {
+                    if ("underline" in value) marks = marks + UnderlineMark()
+                    if ("line-through" in value) marks = marks + StrikeMark()
+                    if (value == "none") marks = marks - UnderlineMark() - StrikeMark()
+                }
+                // any explicit non-transparent background reads as a highlight
+                "background-color" -> if (value != "transparent" && ExportHtml.safeColor(hexOf(value)) != null) {
+                    marks = marks + HighlightMark()
+                }
+                ExportHtml.COLOR -> {
+                    // a declared default (#000000, transparent, an unparseable value) CLEARS the
+                    // inherited color — it overrides in CSS — rather than being ignored
+                    color = ExportHtml.safeColor(hexOf(value))?.takeIf { it !in DEFAULT_TEXT_COLORS }
+                    styleTouched = true
+                }
+                ExportHtml.FONT_SIZE -> parseFontSize(value)?.let {
+                    fontSize = it
+                    styleTouched = true
+                }
             }
         }
-        if (color == null && fontSize == TextStyleAttrs.UNSET_FONT_SIZE) return null
-        return TextStyleMark(TextStyleAttrs(color = color ?: "", fontSize = fontSize))
+        if (styleTouched || inheritedStyle != null) {
+            marks = marks.filterNotTo(mutableSetOf()) { it is TextStyleMark }
+            if (color != null || fontSize != TextStyleAttrs.UNSET_FONT_SIZE) {
+                marks = marks + TextStyleMark(TextStyleAttrs(color = color ?: "", fontSize = fontSize))
+            }
+        }
+        return marks
     }
+
+    /**
+     * [value] with an `rgb()`/`rgba()` form converted to hex — browser copies inline computed
+     * styles, which always come back as `rgb(36, 36, 36)` — passed through otherwise. A fully
+     * transparent `rgba(…, 0)` becomes `transparent` so the highlight and color gates treat it
+     * as the non-color it is; a translucent alpha keeps its channels (a half-opaque yellow is
+     * still a highlight).
+     */
+    private fun hexOf(value: String): String {
+        val match = RGB_COLOR.find(value) ?: return value
+        val parts = match.groupValues[1].split(',').map { it.trim().toDoubleOrNull() ?: return value }
+        if (parts.size !in 3..4) return value
+        val channels = parts.take(3).map { kotlin.math.round(it).toInt() }
+        if (channels.any { it !in 0..255 }) return value
+        if (parts.size == 4 && parts[3] <= 0.0) return "transparent"
+        return buildString {
+            append('#')
+            channels.forEach { channel ->
+                append(channel.toString(16).padStart(2, '0'))
+            }
+        }
+    }
+
+    /** A `font-size` in px or pt (Google Docs emits pt, with float noise) as whole pixels. */
+    private fun parseFontSize(value: String): Int? = when {
+        value.endsWith("px") -> value.removeSuffix("px").trim().toDoubleOrNull()
+        value.endsWith("pt") -> value.removeSuffix("pt").trim().toDoubleOrNull()?.times(PX_PER_PT)
+        else -> null
+    }?.let { kotlin.math.round(it).toInt() }?.takeIf { it in 1..MAX_FONT_SIZE }
 
     private fun alignOf(element: Element): TextAlign {
         val style = element.attrs["style"] ?: return TextAlign.Left
@@ -578,7 +676,18 @@ internal class HtmlParser {
         const val LANGUAGE_CLASS_PREFIX = "language-"
         const val MAX_ENTITY_LENGTH = 12
         const val MAX_FONT_SIZE = 512
+        const val BOLD_WEIGHT = 600
+        const val PX_PER_PT = 4.0 / 3.0
 
+        /**
+         * Colors treated as "no color set": Google Docs stamps `color:#000000` on every span,
+         * styled or not, so importing it verbatim would coat whole pastes in explicit black —
+         * wrong in dark themes and pure noise in the document.
+         */
+        val DEFAULT_TEXT_COLORS = setOf("#000000", "#000")
+
+        /** The named entities that show up in real clipboard HTML (#152) — punctuation and
+         *  symbols producers substitute for typed characters — plus the XML five. */
         val NAMED_ENTITIES = mapOf(
             "amp" to "&",
             "lt" to "<",
@@ -586,16 +695,35 @@ internal class HtmlParser {
             "quot" to "\"",
             "apos" to "'",
             "nbsp" to " ",
+            "rsquo" to "\u2019",
+            "lsquo" to "\u2018",
+            "rdquo" to "\u201D",
+            "ldquo" to "\u201C",
+            "ndash" to "\u2013",
+            "mdash" to "\u2014",
+            "hellip" to "\u2026",
+            "middot" to "\u00B7",
+            "bull" to "\u2022",
+            "deg" to "\u00B0",
+            "copy" to "\u00A9",
+            "reg" to "\u00AE",
+            "trade" to "\u2122",
+            "times" to "\u00D7",
+            "laquo" to "\u00AB",
+            "raquo" to "\u00BB",
+            "shy" to "",
         )
 
         val RAW_TEXT_ELEMENTS = setOf("script", "style")
-        val DROPPED_ELEMENTS = setOf("script", "style", "head", "title", "template")
+        val DROPPED_ELEMENTS = setOf("script", "style", "head", "title", "template", "svg")
         val VOID_ELEMENTS = setOf("br", "img", "input", "hr", "meta", "link", "col", "area", "base", "embed", "source", "track", "wbr")
         val BLOCK_TAGS = setOf(
             "p", "h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol", "blockquote",
             "table", "img", "pre", "div",
         )
         val LIST_CONTAINER_TAGS = setOf("ul", "ol")
+        val INLINE_TAGS = setOf("span", "a", "b", "strong", "i", "em", "u", "ins", "s", "del", "strike", "mark", "font", "sub", "sup", "code", "small")
+        val RGB_COLOR = Regex("""^rgba?\(([^)]+)\)$""")
         val CELL_TAGS = setOf("td", "th")
         val TABLE_SECTION_TAGS = setOf("thead", "tbody", "tfoot")
         val WHITESPACE_RUN = Regex("""\s+""")
